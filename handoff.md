@@ -34,8 +34,9 @@ This has been the entire focus of work so far, across multiple sessions.
 ### Known real-world constraints on submitted photos
 - Covers are behind plastic sleeves → **glare** is a persistent, significant
   issue, and tends to fragment edge detection — the **bottom edge in
-  particular** is observed to break up more often than the top edge (see
-  "Top-line-informed bottom-edge detection" below, added to address this)
+  particular** is observed to break up more often than the top edge (this is
+  the motivation behind both the top-line-informed Hough matching and the new
+  ROI+line-fit approach described below)
 - Photos may be taken at an **angle**, not straight-on
 - **Hand may be in frame** holding the album — currently unresolved, deferred
   (see "Deferred / Known Issues" below)
@@ -77,47 +78,93 @@ This has been the entire focus of work so far, across multiple sessions.
   targeted fix for glare-broken edges (reconnects weak-but-connected
   segments) rather than lowering both thresholds indiscriminately.
 
-### 4. Line Detection — `detect_top_bottom_lines(edges, image_shape)`
-- Runs `cv2.HoughLinesP` (threshold=50, minLineLength=width*0.3,
+### 4. Top-Edge Detection (Hough-based) — `detect_top_bottom_lines(edges, image_shape)`
+- Runs `cv2.HoughLinesP` (threshold=150, minLineLength=width*0.3,
   maxLineGap=150) on the Canny output, filters for roughly-horizontal lines
-  (±10°/170° tolerance), splits candidates into top-half/bottom-half by
-  average y-coordinate.
-- **Top line**: picked as the longest candidate in the top half — this edge
-  is reliably detected in practice.
-- **Bottom line** (new this session — see below): instead of independently
-  picking "longest candidate in the bottom half," now uses the top line as a
-  prior via `find_matching_bottom_line()`, falling back to the old
-  longest-candidate approach only if nothing matches.
+  (±10°/170° tolerance).
+- **Top line**: candidates are restricted to lines whose average y falls in
+  the **top 20% of the image height** (tightened from an earlier "top half"
+  rule), then the longest candidate in that band is picked. Restricting to
+  the top 20% keeps interior horizontal lines (text, artwork detail) from
+  being mistaken for the top edge. The top edge is reliably detected in
+  practice.
 - `visualize_lines()`: draws detected top (green) / bottom (red) lines for
   visual sanity-checking.
 
-#### Top-line-informed bottom-edge detection (new)
+#### Top-line-informed bottom-edge detection (Hough path, still active)
+This function still runs inside `detect_top_bottom_lines` and produces the
+`bottom_line` currently used by the main warp pipeline (cells using
+`resolve_corners`/`warp_to_rectangle`, and the `sample_files` batch loop).
 Motivated by the observation that the top edge is detected reliably far more
 often than the bottom edge, and that an album cover's bottom edge should be
-close to the same angle and length as its top edge. Two new helper functions:
-- `merge_collinear_segments(segments, y_tolerance=15)`: clusters Hough
-  segments by average y-position (within `y_tolerance` px on the downscaled
-  image) and merges each cluster into one segment spanning its extreme
-  left/right endpoints — bridges glare-fragmented pieces of the same physical
-  edge back into one line.
-- `find_matching_bottom_line(bottom_candidates, top_line, angle_tolerance=5)`:
-  filters bottom-half candidates to those within `angle_tolerance` degrees of
-  the top line's angle (filters out unrelated lines — a hand, a shadow, a
-  reflection), merges matching fragments via the above, then picks whichever
-  merged candidate's length is closest to the top line's length.
-- **Status: implemented and wired into `detect_top_bottom_lines`, not yet
-  visually validated by the user** against a real photo with a
-  glare-fragmented bottom edge. Next thing to check: run `visualize_lines()`
-  on such a photo and confirm the reconstructed bottom line tracks the true
-  edge. `angle_tolerance` (5°) and `y_tolerance` (15px) are the two knobs to
-  tune if it's too strict/loose.
+close to the same angle and length as its top edge. Helper functions:
+- `merge_collinear_segments(segments, y_tolerance=20)`: clusters Hough
+  segments by average y-position and merges each cluster into one segment
+  spanning its extreme left/right endpoints — bridges glare-fragmented pieces
+  of the same physical edge back into one line.
+- `find_matching_bottom_line(bottom_candidates, top_line, image_height,
+  angle_tolerance=5, min_separation_frac=0.3)`: filters bottom-half candidates
+  to those (a) within `angle_tolerance` degrees of the top line's angle, and
+  (b) at least `min_separation_frac` (30%) of the image height away from the
+  top line — both checked as a **pairing constraint** on each
+  (top_line, candidate) pair rather than as an upfront absolute-position
+  filter, since "far enough" depends on where the top line actually landed,
+  not on a fixed row in the frame. Matching candidates are merged via the
+  above, then the merged candidate whose length is closest to the top line's
+  length is picked. Falls back to the old "longest candidate in bottom half"
+  approach if nothing matches on angle+separation.
+- **Status**: implemented, wired in, angle_tolerance/min_separation_frac
+  tunable. Not fully validated yet against a real glare-fragmented photo via
+  `visualize_lines()`. A length-extension idea (stretch a bottom line that's
+  <80% of the top line's length back out to match it) was tried and then
+  explicitly reverted at the user's request — not in the current pipeline.
 
-### 5. Corner Resolution + Perspective Warp
+### 5. Bottom-Edge Detection (new: ROI mask + robust line fit)
+A second, more direct approach to the bottom edge was added this session,
+running in parallel with (not yet replacing) the Hough-based
+`find_matching_bottom_line` path above. Motivation: Hough's segment-based
+detection struggles when glare breaks the bottom edge into many small
+pieces; this approach instead masks down to just the expected bottom-edge
+region and fits a line directly through the raw Canny edge pixels in that
+region.
+- `build_bottom_roi_mask(top_line, image_shape, band_start_frac=0.7,
+  band_end_frac=0.98)`: builds a binary mask isolating a band roughly the
+  bottom ~28% of the frame (from 70% down to 98% down the image height,
+  measured from the top edge's average y), **tilted to follow the top edge's
+  slope** column-by-column so the band tracks the expected tilt of a
+  (roughly parallel) bottom edge rather than being a flat horizontal strip.
+- `extract_edge_points(edges, roi_mask)`: `cv2.bitwise_and`s the Canny edge
+  map with the ROI mask and returns the surviving edge pixel coordinates.
+- `fit_bottom_line(points)`: fits a line through those points via
+  `cv2.fitLine` with `DIST_HUBER` (robust to outlier points — stray marks,
+  noise — unlike an ordinary least-squares fit), returns `(slope,
+  intercept)`. Requires at least 10 points or returns `None`.
+- `bottom_corners_from_fit(slope, intercept, width)`: extrapolates the fitted
+  line to the image's left (`x=0`) and right (`x=width`) borders to get
+  bottom-left/bottom-right corner points directly — no separate Hough
+  segment endpoints needed.
+- `resolve_bottom_edge(top_line, edges, image_shape)`: orchestrates the above
+  four steps into one call.
+- `visualize_fit()`: sanity-check plot — green-tinted ROI band, yellow
+  candidate edge points, red fitted/extrapolated line.
+- **Status: newly added, exercised in one scratch cell
+  (`top_line, bottom_line = detect_top_bottom_lines(...)` →
+  `build_bottom_roi_mask` → `extract_edge_points` → `fit_bottom_line` →
+  `bottom_corners_from_fit` → `visualize_fit`), not yet wired into the main
+  `resolve_corners`/`warp_to_rectangle` pipeline.** The scratch cell ends with
+  a comment noting the remaining step: combine `bottom_left`/`bottom_right`
+  from this path with the existing top-line corner logic into a single
+  `corners` array for `warp_to_rectangle`. Not yet validated visually against
+  a real glare-fragmented photo.
+
+### 6. Corner Resolution + Perspective Warp (current main pipeline)
 - `resolve_corners(top_line, bottom_line, image_shape)`: extracts 4 corner
   points directly from the top/bottom line endpoints (left-to-right sorted).
   No separate frame-border fallback logic needed — a Hough segment cut off by
   the frame naturally has its endpoint sitting at the image boundary anyway.
-  Returns `None` if either line is missing.
+  Returns `None` if either line is missing. Currently still fed by the
+  Hough-based `bottom_line` from `detect_top_bottom_lines` (Section 4), not
+  yet by the new ROI+fit path from Section 5.
 - `rescale_corners(corners, scale_factor)`: maps corners found on the
   downscaled image back to full-resolution coordinate space
   (`corners / scale_factor`).
@@ -128,15 +175,16 @@ close to the same angle and length as its top edge. Two new helper functions:
   end-to-end.
 - `visualize_warp()`: displays the warped result.
 
-### 6. Multi-photo batch test (`sample_files` loop)
+### 7. Multi-photo batch test (`sample_files` loop)
 A cell that runs the full per-image pipeline (load → exif-correct → downscale
 → edge/line detect → resolve corners → rescale → warp) across multiple real
 sample photos in a loop, displaying results side by side. Currently exercises
-7 of the 11 available files in `Gold_Dots/`. Skips (prints a message, doesn't
+8 of the 11 available files in `Gold_Dots/`. Skips (prints a message, doesn't
 crash) any file where corner resolution fails rather than halting the whole
-batch — useful for surfacing which covers/angles are still problematic.
+batch — useful for surfacing which covers/angles are still problematic. Still
+uses the Hough-based bottom-edge path (Section 4/6), not the new ROI+fit path.
 
-## Bugs Found & Fixed This Session
+## Bugs Found & Fixed
 1. **`sorted_endpoints()` malformed ternary** (earlier session) — fixed to an
    explicit if/else.
 2. **`corners_full = rescale_corners(corners_small, scale_factor)` warped
@@ -145,21 +193,28 @@ batch — useful for surfacing which covers/angles are still problematic.
    "full-res warp" was actually warping the small image with full-res-scaled
    corner coordinates (a coordinate-space mismatch). Fixed by capturing
    `bgr_array_original`/`rgb_array_original` before any downscaling and
-   warping against that instead.
-2b. Follow-up: `bgr_array_original` was itself briefly built from a stray
-   reference to `rgb_array` (a variable not yet defined at that point in a
-   fresh kernel — only "worked" via leftover state from a previous run).
-   Fixed to reference `rgb_array_original` correctly.
+   warping against that instead. Follow-up: `bgr_array_original` was itself
+   briefly built from a stray reference to `rgb_array` (a variable not yet
+   defined at that point in a fresh kernel — only "worked" via leftover state
+   from a previous run). Fixed to reference `rgb_array_original` correctly.
 3. **`sample_files` batch loop crashed with `TypeError: unsupported operand
    type(s) for /: 'NoneType' and 'float'`**: the loop ran edge/line detection
    directly on full-resolution images (skipped the downscale step entirely),
    so Hough detection failed for some files (`None` line), and it also reused
    `small`/`scale_factor`/`bgr_array_original` left over from the single-image
-   pipeline above it instead of computing them per-file — meaning even a
-   successful run would have warped every photo against the same (wrong)
-   image. Fixed: each loop iteration now downscales its own image, tracks its
-   own `file_scale_factor` and full-res array, and skips with a printed
-   message instead of crashing if corner resolution fails.
+   pipeline above it instead of computing them per-file. Fixed: each loop
+   iteration now downscales its own image, tracks its own
+   `file_scale_factor` and full-res array, and skips with a printed message
+   instead of crashing if corner resolution fails.
+4. **`find_matching_bottom_line`/`detect_top_bottom_lines` argument mismatch**
+   (introduced and fixed within this session): while adding the 30%
+   min-separation pairing constraint, a later revert (undoing an unrelated
+   length-extension experiment) accidentally rolled `find_matching_bottom_line`
+   back to its pre-separation-constraint signature (no `image_height`/
+   `min_separation_frac` params), while `detect_top_bottom_lines` still called
+   it with `height` as a third positional argument — which silently landed in
+   `angle_tolerance` instead of raising an error, disabling the angle filter
+   rather than crashing. Re-fixed by restoring the full signature.
 
 ## Deferred / Known Issues (Not Yet Addressed)
 1. **Hand in frame**: user's photos sometimes include their hand holding the
@@ -172,30 +227,38 @@ batch — useful for surfacing which covers/angles are still problematic.
    Full case-based handling (detecting which of the 4 edges are actually
    present vs. cut off by frame, reconstructing missing corners
    mathematically) was scoped out in detail but explicitly deferred until the
-   top/bottom-anchored majority case is working end-to-end. See prior
-   conversation for the originally proposed branching logic (full detection →
-   3-edge right-angle reconstruction → 2-opposite-edges frame-border fallback
-   → unprocessable flag).
+   top/bottom-anchored majority case is working end-to-end.
 3. **Glare handling at the embedding stage** (not just preprocessing):
    originally discussed masking specular highlights or multi-crop embedding
    strategies — not yet started, still just a plan.
 4. Embedding generation, reference vector storage, and similarity
    matching/thresholding have not been started — all work so far has been on
    preprocessing/perspective correction only.
+5. **Two parallel bottom-edge detection approaches now coexist** (Hough-based
+   `find_matching_bottom_line` vs. the new ROI-mask + robust-fit
+   `resolve_bottom_edge`) — need to decide whether one replaces the other or
+   they're combined (e.g. ROI+fit as the primary method with Hough matching
+   as a fallback), then wire the winner into `resolve_corners`.
 
 ## Next Steps (Suggested Order)
-1. Validate the new top-line-informed bottom-edge detection
-   (`find_matching_bottom_line` / `merge_collinear_segments`) against a real
-   photo with a glare-fragmented bottom edge — confirm via `visualize_lines()`
-   that the reconstructed line tracks the true edge, and tune
-   `angle_tolerance`/`y_tolerance` if needed.
-2. Run the `sample_files` batch loop across all 11 available sample covers
-   (currently only 7 are listed) and review the grid of warped outputs for
+1. Validate the new ROI-mask + robust-line-fit bottom-edge approach
+   (`resolve_bottom_edge` / `visualize_fit`) against a real photo with a
+   glare-fragmented bottom edge, and compare its output against the
+   Hough-based `find_matching_bottom_line` path on the same photos. Tune
+   `band_start_frac`/`band_end_frac` if the ROI band is missing the true edge.
+2. Decide how the two bottom-edge approaches relate (replace vs. fallback vs.
+   combine), then wire the chosen one into `resolve_corners` /
+   `warp_to_rectangle` as the main pipeline.
+3. Re-validate the Hough-based top-line-informed bottom-edge detection
+   (angle + 30% separation pairing constraint) if it remains in use, tuning
+   `angle_tolerance`/`min_separation_frac` as needed.
+4. Run the `sample_files` batch loop across all 11 available sample covers
+   (currently only 8 are listed) and review the grid of warped outputs for
    failure patterns — which covers/angles still fail corner resolution, and
    why.
-3. Return to left/right edge-cut-off handling for the remaining edge cases.
-4. Return to hand-in-frame handling.
-5. Move to embedding generation (CLIP) and reference vector setup for the
+5. Return to left/right edge-cut-off handling for the remaining edge cases.
+6. Return to hand-in-frame handling.
+7. Move to embedding generation (CLIP) and reference vector setup for the
    full album catalog.
-6. Build similarity comparison + thresholding logic.
-7. Begin AWS migration planning once local prototype is validated.
+8. Build similarity comparison + thresholding logic.
+9. Begin AWS migration planning once local prototype is validated.
