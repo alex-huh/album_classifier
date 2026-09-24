@@ -119,14 +119,13 @@ close to the same angle and length as its top edge. Helper functions:
   <80% of the top line's length back out to match it) was tried and then
   explicitly reverted at the user's request — not in the current pipeline.
 
-### 5. Bottom-Edge Detection (new: ROI mask + robust line fit)
-A second, more direct approach to the bottom edge was added this session,
-running in parallel with (not yet replacing) the Hough-based
-`find_matching_bottom_line` path above. Motivation: Hough's segment-based
-detection struggles when glare breaks the bottom edge into many small
-pieces; this approach instead masks down to just the expected bottom-edge
-region and fits a line directly through the raw Canny edge pixels in that
-region.
+### 5. Bottom-Edge Detection (ROI mask + RANSAC line fit)
+A second, more direct approach to the bottom edge, running alongside the
+Hough-based `find_matching_bottom_line` path above. Motivation: Hough's
+segment-based detection struggles when glare breaks the bottom edge into many
+small pieces; this approach instead masks down to just the expected
+bottom-edge region and fits a line directly through the raw Canny edge pixels
+in that region.
 - `build_bottom_roi_mask(top_line, image_shape, band_start_frac=0.7,
   band_end_frac=0.98)`: builds a binary mask isolating a band roughly the
   bottom ~28% of the frame (from 70% down to 98% down the image height,
@@ -135,36 +134,53 @@ region.
   (roughly parallel) bottom edge rather than being a flat horizontal strip.
 - `extract_edge_points(edges, roi_mask)`: `cv2.bitwise_and`s the Canny edge
   map with the ROI mask and returns the surviving edge pixel coordinates.
-- `fit_bottom_line(points)`: fits a line through those points via
-  `cv2.fitLine` with `DIST_HUBER` (robust to outlier points — stray marks,
-  noise — unlike an ordinary least-squares fit), returns `(slope,
-  intercept)`. Requires at least 10 points or returns `None`.
+- `fit_bottom_line_ransac(points, n_iterations=300, inlier_threshold=3.0,
+  min_inliers=10, random_seed=None)`: **replaces the earlier single
+  `DIST_HUBER` fit** (a robust-but-single fit still got pulled off course by
+  a distinct, unrelated cluster of points — e.g. a seam — inside the ROI
+  band). Now repeatedly samples 2 random points, counts how many other points
+  fall within `inlier_threshold` px of the resulting line, and keeps whichever
+  random line had the most support; the winning inlier set is then refit with
+  `cv2.fitLine` (`DIST_L2`) for the final `(slope, intercept, inlier_points)`.
+  Returns `None` if fewer than `min_inliers` points are available or no
+  candidate line clears `min_inliers` support.
+- `slopes_agree(top_line, fitted_slope, max_angle_diff_degrees=10)`: new
+  sanity check — converts both the top line's slope and the fitted bottom
+  line's slope to angles and rejects the fit if they diverge by more than
+  `max_angle_diff_degrees`. Guards against RANSAC locking onto a
+  plausible-looking but wrong line (e.g. a seam) that happens to have enough
+  inlier support.
 - `bottom_corners_from_fit(slope, intercept, width)`: extrapolates the fitted
   line to the image's left (`x=0`) and right (`x=width`) borders to get
   bottom-left/bottom-right corner points directly — no separate Hough
   segment endpoints needed.
-- `resolve_bottom_edge(top_line, edges, image_shape)`: orchestrates the above
-  four steps into one call.
+- `resolve_bottom_edge(top_line, edges, image_shape,
+  max_angle_diff_degrees=15.0, verbose=False)`: orchestrates the full
+  pipeline — ROI mask → extract points → RANSAC fit → `slopes_agree` check →
+  extrapolate corners. Returns `None` (optionally printing why, if
+  `verbose=True`) if RANSAC finds no confident line or the fit fails the
+  slope-agreement check.
 - `visualize_fit()`: sanity-check plot — green-tinted ROI band, yellow
   candidate edge points, red fitted/extrapolated line.
-- **Status: newly added, exercised in one scratch cell
-  (`top_line, bottom_line = detect_top_bottom_lines(...)` →
-  `build_bottom_roi_mask` → `extract_edge_points` → `fit_bottom_line` →
-  `bottom_corners_from_fit` → `visualize_fit`), not yet wired into the main
-  `resolve_corners`/`warp_to_rectangle` pipeline.** The scratch cell ends with
-  a comment noting the remaining step: combine `bottom_left`/`bottom_right`
-  from this path with the existing top-line corner logic into a single
-  `corners` array for `warp_to_rectangle`. Not yet validated visually against
-  a real glare-fragmented photo.
+- **Status: now the bottom-edge method actually used by the batch/export
+  pipelines** — the `sample_files` loop and the `Testing/` → `Processed/`
+  export cell (Section 8) both call `resolve_bottom_edge` directly (paired
+  with `sorted_endpoints(top_line)` for the top corners) instead of going
+  through `resolve_corners`. **The single-image "main pipeline" demo cell
+  (Section 6) has not been switched over** and still resolves the bottom edge
+  via the older Hough-based `detect_top_bottom_lines`/`resolve_corners` path —
+  see Deferred/Known Issues #5.
 
-### 6. Corner Resolution + Perspective Warp (current main pipeline)
+### 6. Corner Resolution + Perspective Warp (single-image demo cell — still Hough-based)
 - `resolve_corners(top_line, bottom_line, image_shape)`: extracts 4 corner
   points directly from the top/bottom line endpoints (left-to-right sorted).
   No separate frame-border fallback logic needed — a Hough segment cut off by
   the frame naturally has its endpoint sitting at the image boundary anyway.
   Returns `None` if either line is missing. Currently still fed by the
   Hough-based `bottom_line` from `detect_top_bottom_lines` (Section 4), not
-  yet by the new ROI+fit path from Section 5.
+  yet by the ROI+RANSAC-fit path from Section 5 — the batch/export cells
+  (Sections 7–8) have already moved to the newer path, so this single-image
+  demo cell is now the outlier (see Deferred/Known Issues #5).
 - `rescale_corners(corners, scale_factor)`: maps corners found on the
   downscaled image back to full-resolution coordinate space
   (`corners / scale_factor`).
@@ -181,8 +197,28 @@ A cell that runs the full per-image pipeline (load → exif-correct → downscal
 sample photos in a loop, displaying results side by side. Currently exercises
 8 of the 11 available files in `Gold_Dots/`. Skips (prints a message, doesn't
 crash) any file where corner resolution fails rather than halting the whole
-batch — useful for surfacing which covers/angles are still problematic. Still
-uses the Hough-based bottom-edge path (Section 4/6), not the new ROI+fit path.
+batch — useful for surfacing which covers/angles are still problematic. Uses
+the ROI+RANSAC bottom-edge path (Section 5) directly, via
+`resolve_bottom_edge` + `sorted_endpoints(top_line)`, not `resolve_corners`.
+
+### 8. `Testing/` → `Processed/` batch export cell
+New cell at the end of the notebook, added to export real-world test photos
+(as opposed to the curated `Gold_Dots/` reference set) through the pipeline.
+- Reads every `.heic`/`.jpg`/`.jpeg`/`.png` file in a new `Testing/` folder
+  (currently 15 HEIC photos — real submitted-style shots, distinct from the
+  11 `Gold_Dots/` reference covers).
+- Per file: same load → exif-correct → downscale → edge/line-detect →
+  `resolve_bottom_edge` → `sorted_endpoints(top_line)` → `rescale_corners` →
+  `warp_to_rectangle` sequence as the `sample_files` loop above, i.e. the
+  ROI+RANSAC bottom-edge path, not the older Hough/`resolve_corners` path.
+- Skips a file (prints a message, doesn't crash) if the top edge can't be
+  detected or `resolve_bottom_edge` can't confidently resolve the bottom edge.
+- Saves each successfully warped result as a PNG into a new `Processed/`
+  folder (created via `os.makedirs(..., exist_ok=True)` if missing), named
+  after the source file's basename, via `cv2.imwrite`.
+- **Status: added, not yet run/reviewed** — output quality across the 15
+  `Testing/` photos (including which ones get skipped) hasn't been checked
+  yet.
 
 ## Bugs Found & Fixed
 1. **`sorted_endpoints()` malformed ternary** (earlier session) — fixed to an
@@ -234,21 +270,28 @@ uses the Hough-based bottom-edge path (Section 4/6), not the new ROI+fit path.
 4. Embedding generation, reference vector storage, and similarity
    matching/thresholding have not been started — all work so far has been on
    preprocessing/perspective correction only.
-5. **Two parallel bottom-edge detection approaches now coexist** (Hough-based
-   `find_matching_bottom_line` vs. the new ROI-mask + robust-fit
-   `resolve_bottom_edge`) — need to decide whether one replaces the other or
-   they're combined (e.g. ROI+fit as the primary method with Hough matching
-   as a fallback), then wire the winner into `resolve_corners`.
+5. **Two parallel bottom-edge detection approaches still coexist, and the
+   notebook is now inconsistent about which one it uses.** The batch/export
+   cells (`sample_files` loop, `Testing/`→`Processed/` export) have already
+   switched to the newer ROI-mask + RANSAC-fit `resolve_bottom_edge`, but the
+   single-image "main pipeline" demo cell (Section 6) still uses the older
+   Hough-based `find_matching_bottom_line`/`resolve_corners` path. Still need
+   to decide whether one replaces the other outright or they're combined
+   (e.g. ROI+RANSAC as primary with Hough matching as a fallback), then
+   update the single-image demo cell to match the batch cells so the whole
+   notebook uses one consistent method.
 
 ## Next Steps (Suggested Order)
-1. Validate the new ROI-mask + robust-line-fit bottom-edge approach
-   (`resolve_bottom_edge` / `visualize_fit`) against a real photo with a
-   glare-fragmented bottom edge, and compare its output against the
-   Hough-based `find_matching_bottom_line` path on the same photos. Tune
-   `band_start_frac`/`band_end_frac` if the ROI band is missing the true edge.
+1. Run the new `Testing/` → `Processed/` export cell and review the 15
+   warped outputs (and any skip messages) for failure patterns — this is the
+   first real check of the ROI-mask + RANSAC-fit bottom-edge approach against
+   real-world (not curated `Gold_Dots/`) photos. Tune `band_start_frac`/
+   `band_end_frac`/`max_angle_diff_degrees` if the ROI band or slope check is
+   rejecting good fits.
 2. Decide how the two bottom-edge approaches relate (replace vs. fallback vs.
-   combine), then wire the chosen one into `resolve_corners` /
-   `warp_to_rectangle` as the main pipeline.
+   combine), then update the single-image demo cell (Section 6) to use
+   `resolve_bottom_edge` like the batch/export cells do, so the whole
+   notebook is consistent (see Deferred/Known Issues #5).
 3. Re-validate the Hough-based top-line-informed bottom-edge detection
    (angle + 30% separation pairing constraint) if it remains in use, tuning
    `angle_tolerance`/`min_separation_frac` as needed.
