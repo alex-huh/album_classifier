@@ -94,7 +94,9 @@ def in_stock(count):
 
 
 def load_albums(stocked_only=True):
-    """(artist, album) rows from the sheet; an album counts as stocked if any of its rows is."""
+    """(artist, album) rows from the sheet; an album counts as stocked if any of its rows is.
+
+    stocked_only=None returns every album regardless of stock."""
     df = pd.read_excel(XLSX, usecols=[0, 1, 2, 3])
     df.columns = ["artist", "album", "store", "warehouse"]
     df = df.dropna(subset=["artist", "album"])
@@ -102,6 +104,8 @@ def load_albums(stocked_only=True):
     df["album"] = df["album"].astype(str).str.strip()
     df["stocked"] = df["store"].map(in_stock) | df["warehouse"].map(in_stock)
     df = df.groupby(["artist", "album"], sort=False, as_index=False)["stocked"].any()
+    if stocked_only is None:
+        return df[["artist", "album"]]
     return df[df["stocked"] == stocked_only][["artist", "album"]]
 
 
@@ -161,10 +165,11 @@ def fetch_first_cover(mbids, dest):
         return f"error: {e}"
 
 
-def main():
+def main(df=None):
     sys.stdout.reconfigure(encoding="utf-8")
     OUT_DIR.mkdir(exist_ok=True)
-    df = load_albums()
+    if df is None:
+        df = load_albums()
 
     missing = []
     downloads = {}  # (artist, album) -> future
